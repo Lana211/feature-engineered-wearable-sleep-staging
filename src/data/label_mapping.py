@@ -10,7 +10,8 @@ from src.config import TARGET_LABELS
 
 PREPARATION_LABELS = {"P", "PREP", "PREPARATION"}
 WAKE_LABELS = {"W", "WAKE"}
-NON_REM_LABELS = {"N1", "N2", "N3", "NREM", "NON-REM", "NON_REM", "NON REM"}
+LIGHT_LABELS = {"N1", "N2"}
+DEEP_LABELS = {"N3"}
 REM_LABELS = {"R", "REM"}
 
 
