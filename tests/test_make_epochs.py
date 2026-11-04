@@ -40,7 +40,7 @@ def test_build_epoch_index_maps_labels_and_excludes_preparation(tmp_path):
     assert len(epoch_index) == 4
     assert not bool(epoch_index.loc[0, "is_valid_epoch"])
     assert epoch_index.loc[0, "exclusion_reason"] == "excluded_label"
-    assert epoch_index.loc[1:, "mapped_label"].tolist() == ["Wake", "Non-REM", "REM"]
+    assert epoch_index.loc[1:, "mapped_label"].tolist() == ["Wake", "Light", "REM"]
     assert set(epoch_index["split"]) == {"train"}
 
 
@@ -76,7 +76,7 @@ def test_build_epoch_index_can_infer_nonzero_start_offset(tmp_path):
     epoch_index = build_epoch_index(raw_dir, split_path, rows_per_epoch=2)
 
     assert epoch_index["epoch_start_offset_rows"].unique().tolist() == [1]
-    assert epoch_index["mapped_label"].tolist() == ["Wake", "Non-REM", "REM"]
+    assert epoch_index["mapped_label"].tolist() == ["Wake", "Light", "REM"]
 
 
 def test_build_epoch_index_marks_mixed_label_epochs_invalid(tmp_path):
@@ -212,9 +212,9 @@ def test_segmented_epoching_splits_around_long_unmapped_blocks(tmp_path):
     assert segmented["raw_label"].tolist() == ["W", "N2", "W", "N2", "W", "REM"]
     assert segmented["mapped_label"].tolist() == [
         "Wake",
-        "Non-REM",
+        "Light",
         "Wake",
-        "Non-REM",
+        "Light",
         "Wake",
         "REM",
     ]
