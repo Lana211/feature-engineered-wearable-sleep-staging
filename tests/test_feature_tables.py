@@ -48,7 +48,7 @@ def test_build_and_write_basic_feature_tables_keep_split_rows_separate(tmp_path)
     features = build_basic_feature_table(raw_dir, epoch_index_path)
     written = write_split_feature_tables(features, tmp_path / "processed")
 
-    assert set(features["label"]) == {"Wake", "Non-REM", "REM"}
+    assert set(features["label"]) == {"Wake", "Light", "REM"}
     assert "BVP_mean" in features.columns
     assert "ACC_MAG_mean" in features.columns
     assert pd.read_csv(written["train"])["split"].tolist() == ["train"]
