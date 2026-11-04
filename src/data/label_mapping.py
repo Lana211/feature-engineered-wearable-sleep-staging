@@ -24,14 +24,15 @@ def normalize_stage_text(stage: object) -> str | None:
 
 
 def map_sleep_stage(stage: object) -> str | None:
-    """Map DREAMT sleep-stage labels to Wake, Non-REM, REM, or exclusion."""
-    normalized = normalize_stage_text(stage)
+    """Map DREAMT sleep-stage labels to Wake, Light, Deep, REM, or exclusion."""    normalized = normalize_stage_text(stage)
     if normalized is None or normalized in PREPARATION_LABELS:
         return None
     if normalized in WAKE_LABELS:
         return "Wake"
-    if normalized in NON_REM_LABELS:
-        return "Non-REM"
+    if normalized in LIGHT_LABELS:
+        return "Light"
+    if normalized in DEEP_LABELS:
+        return "Deep"
     if normalized in REM_LABELS:
         return "REM"
     return None
