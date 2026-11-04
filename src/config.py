@@ -8,7 +8,7 @@ from pathlib import Path
 PROJECT_TITLE = (
     "Feature-Engineered Machine Learning for Wearable Sleep Stage Classification"
 )
-TARGET_LABELS = ("Wake", "Non-REM", "REM")
+TARGET_LABELS = ("Wake", "Light", "Deep", "REM")
 SPLIT_ORDER = ("train", "validation", "test")
 
 RAW_SIGNAL_COLUMNS = (
