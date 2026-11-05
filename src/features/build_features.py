@@ -8,38 +8,32 @@ import numpy as np
 import pandas as pd
 
 from src.config import RAW_SIGNAL_COLUMNS, SPLIT_ORDER, TARGET_LABELS
+from src.data.harmonize import HARMONIZED_SIGNAL_COLUMNS, harmonize_dreamt_epoch
 from src.data.load_dreamt import extract_participant_id, list_participant_csvs
 from src.features.acc_features import ACC_MAGNITUDE_COLUMN, accelerometer_magnitude
-from src.features.base_features import (
-    summarize_epoch,
-    summarize_signal,
-    summarize_signal_array,
-)
+from src.features.base_features import summarize_epoch, summarize_signal
 from src.features.feature_manifest import write_feature_manifest
-from src.features.rolling_features import (
-    add_centered_rolling_stats,
-    add_participant_zscores,
-)
-from src.features.signal_features import summarize_signal_specific_arrays
 
 FEATURE_ID_COLUMNS = ["participant_id", "epoch_id", "split", "label"]
 SPLIT_OUTPUT_NAMES = {"train": "train", "validation": "val", "test": "test"}
 FEATURE_SETS = ("basic", "rich")
-DEFAULT_ROLLING_WINDOWS = (3, 5, 15)
-DEFAULT_CONTEXT_SOURCE_FEATURES = (
-    "BVP_mean",
-    "ACC_MAG_mean",
-    "ACC_MAG_std",
-    "TEMP_mean",
-    "EDA_mean",
-    "IBI_mean",
-    "HR_mean",
-    "IBI_rmssd",
-    "IBI_pnn50",
-    "HR_abs_diff_mean",
+NORMALIZED_PREFIXES = ("HR_", "IBI_", "TEMP_")
+NORMALIZED_SUFFIX = "_norm"
+SOMNIA_FEATURE_COLUMNS = (
+    "ACC_mean",
+    "ACC_std",
+    "ACC_iqr",
+    "ACC_max",
+    "HR_mean_norm",
+    "HR_std_norm",
+    "HR_min_norm",
+    "HR_max_norm",
+    "HR_range_norm",
+    "IBI_mean_norm",
+    "IBI_sdnn_norm",
+    "IBI_rmssd_norm",
+    "TEMP_mean_norm",
 )
-TEMPORARY_CONTEXT_COLUMNS = ("_segment_id",)
-PARTICIPANT_ZSCORE_EXCLUDED_SUFFIXES = ("_valid_fraction",)
 EPOCH_INDEX_STRING_COLUMNS = {
     "participant_id": str,
     "split": str,
@@ -98,51 +92,101 @@ def build_basic_feature_table(
 def build_rich_feature_table(
     raw_dir: str | Path = "data/raw",
     epoch_index_path: str | Path = "data/interim/epoch_index.csv",
-    *,
-    rolling_windows: tuple[int, ...] = DEFAULT_ROLLING_WINDOWS,
-    context_source_features: tuple[str, ...] = DEFAULT_CONTEXT_SOURCE_FEATURES,
 ) -> pd.DataFrame:
-    """Build modular rich features for valid 30-second epochs.
+    """Build the Somnia feature table from harmonized 30-second epochs.
 
-    The rich table starts with deterministic per-epoch features, then adds
-    participant-contained temporal context features and whole-night
-    participant-normalized z-scores. No labels are used except to carry the
-    target column forward.
+    Each epoch is harmonized first, then movement, heart-rate, IBI, and
+    temperature features are computed. Heart-rate, IBI, and temperature
+    features are normalized per participant with the median and the
+    5th-95th percentile range.
     """
-    epoch_features = _build_epoch_level_feature_table(
-        raw_dir=raw_dir,
-        epoch_index_path=epoch_index_path,
-        include_signal_specific=True,
-        include_context_metadata=True,
-    )
-    if epoch_features.empty:
-        return pd.DataFrame(columns=FEATURE_ID_COLUMNS)
+    epoch_index = load_valid_epoch_index(epoch_index_path)
+    participant_paths = _participant_path_lookup(raw_dir)
+    rows: list[dict[str, object]] = []
 
-    per_epoch_feature_columns = _feature_columns(epoch_features)
-    participant_zscore_columns = _participant_zscore_source_columns(
-        per_epoch_feature_columns
-    )
-    context_columns = [
-        column for column in context_source_features if column in epoch_features.columns
-    ]
-    context_group_columns = _context_group_columns(epoch_features)
-    features = epoch_features
-    for window_epochs in rolling_windows:
-        features = add_centered_rolling_stats(
-            features,
-            context_columns,
-            window_epochs=window_epochs,
-            statistics=("mean", "std"),
-            group_cols=context_group_columns,
+    for participant_id, participant_epochs in epoch_index.groupby(
+        "participant_id", sort=True
+    ):
+        participant_id = str(participant_id)
+        if participant_id not in participant_paths:
+            raise ValueError(f"Raw CSV for {participant_id} is missing from {raw_dir}.")
+
+        participant = _load_participant_signal_frame(
+            participant_paths[participant_id], HARMONIZED_SIGNAL_COLUMNS
         )
+        signal_arrays = {
+            column: pd.to_numeric(participant[column], errors="coerce").to_numpy(
+                dtype=float
+            )
+            for column in HARMONIZED_SIGNAL_COLUMNS
+            if column in participant.columns
+        }
+        for epoch_row in participant_epochs.itertuples(index=False):
+            epoch_arrays = harmonize_dreamt_epoch(
+                signal_arrays, int(epoch_row.start_row), int(epoch_row.end_row)
+            )
+            rows.append(
+                {
+                    "participant_id": participant_id,
+                    "epoch_id": int(epoch_row.epoch_id),
+                    "split": str(epoch_row.split),
+                    "label": str(epoch_row.mapped_label),
+                    **somnia_epoch_features(epoch_arrays),
+                }
+            )
 
-    features = add_participant_zscores(features, participant_zscore_columns)
-    features = features.drop(
-        columns=[
-            column for column in TEMPORARY_CONTEXT_COLUMNS if column in features.columns
-        ]
-    )
+    if not rows:
+        return pd.DataFrame(columns=FEATURE_ID_COLUMNS)
+    features = normalize_per_participant(pd.DataFrame(rows))
     return _ordered_feature_table(features)
+
+
+def somnia_epoch_features(epoch_arrays: dict[str, np.ndarray]) -> dict[str, float]:
+    """Compute the Somnia features for one harmonized epoch."""
+    features: dict[str, float] = {}
+
+    magnitude = _acc_magnitude(epoch_arrays)
+    features["ACC_mean"] = _mean(magnitude)
+    features["ACC_std"] = _std(magnitude)
+    features["ACC_iqr"] = _iqr(magnitude)
+    features["ACC_max"] = _max(magnitude)
+
+    hr = _finite(epoch_arrays.get("HR"))
+    features["HR_mean"] = _mean(hr)
+    features["HR_std"] = _std(hr)
+    features["HR_min"] = _min(hr)
+    features["HR_max"] = _max(hr)
+    features["HR_range"] = features["HR_max"] - features["HR_min"]
+
+    ibi = np.asarray(epoch_arrays.get("IBI", []), dtype=float)
+    beats = _finite(ibi)
+    diffs = np.diff(ibi)
+    diffs = diffs[np.isfinite(diffs)]
+    features["IBI_mean"] = _mean(beats)
+    features["IBI_sdnn"] = _std(beats)
+    features["IBI_rmssd"] = (
+        float(np.sqrt(np.mean(np.square(diffs)))) if diffs.size else np.nan
+    )
+
+    features["TEMP_mean"] = _mean(_finite(epoch_arrays.get("TEMP")))
+    return features
+
+
+def normalize_per_participant(features: pd.DataFrame) -> pd.DataFrame:
+    """Replace HR, IBI, and TEMP features with (x - median) / (P95 - P5)."""
+    features = features.copy()
+    columns = [
+        column for column in features.columns if column.startswith(NORMALIZED_PREFIXES)
+    ]
+    for column in columns:
+        grouped = features.groupby("participant_id")[column]
+        median = grouped.transform("median")
+        spread = grouped.transform(lambda values: values.quantile(0.95)) - (
+            grouped.transform(lambda values: values.quantile(0.05))
+        )
+        spread = spread.where(spread > 0)
+        features[f"{column}{NORMALIZED_SUFFIX}"] = (features[column] - median) / spread
+    return features.drop(columns=columns)
 
 
 def write_split_feature_tables(
@@ -243,11 +287,13 @@ def _participant_path_lookup(raw_dir: str | Path) -> dict[str, Path]:
     }
 
 
-def _load_participant_signal_frame(path: str | Path) -> pd.DataFrame:
+def _load_participant_signal_frame(
+    path: str | Path, columns: tuple[str, ...] = RAW_SIGNAL_COLUMNS
+) -> pd.DataFrame:
     """Load only signal columns needed for feature extraction."""
     csv_path = Path(path)
     available_columns = pd.read_csv(csv_path, nrows=0).columns
-    usecols = [column for column in RAW_SIGNAL_COLUMNS if column in available_columns]
+    usecols = [column for column in columns if column in available_columns]
     if not usecols:
         raise ValueError(f"{csv_path} does not contain any expected signal columns.")
     return pd.read_csv(csv_path, usecols=usecols)
@@ -262,120 +308,46 @@ def _basic_epoch_features(epoch: pd.DataFrame) -> dict[str, float]:
     return features
 
 
-def _build_epoch_level_feature_table(
-    *,
-    raw_dir: str | Path,
-    epoch_index_path: str | Path,
-    include_signal_specific: bool,
-    include_context_metadata: bool,
-) -> pd.DataFrame:
-    epoch_index = load_valid_epoch_index(epoch_index_path)
-    participant_paths = _participant_path_lookup(raw_dir)
-    rows: list[dict[str, object]] = []
-
-    for participant_id, participant_epochs in epoch_index.groupby(
-        "participant_id", sort=True
-    ):
-        participant_id = str(participant_id)
-        if participant_id not in participant_paths:
-            raise ValueError(f"Raw CSV for {participant_id} is missing from {raw_dir}.")
-
-        participant = _load_participant_signal_frame(participant_paths[participant_id])
-        signal_arrays = _participant_signal_arrays(participant)
-        for epoch_row in participant_epochs.itertuples(index=False):
-            start_row = int(epoch_row.start_row)
-            end_row = int(epoch_row.end_row)
-            features = _basic_epoch_features_from_arrays(
-                signal_arrays, start_row, end_row
-            )
-            if include_signal_specific:
-                features.update(
-                    summarize_signal_specific_arrays(signal_arrays, start_row, end_row)
-                )
-            row = {
-                "participant_id": participant_id,
-                "epoch_id": int(epoch_row.epoch_id),
-                "split": str(epoch_row.split),
-                "label": str(epoch_row.mapped_label),
-                **features,
-            }
-            if include_context_metadata and hasattr(epoch_row, "segment_id"):
-                segment_id = epoch_row.segment_id
-                row["_segment_id"] = int(segment_id) if pd.notna(segment_id) else -1
-            rows.append(row)
-
-    if not rows:
-        return pd.DataFrame(columns=FEATURE_ID_COLUMNS)
-    return _ordered_feature_table(pd.DataFrame(rows), include_temporary=True)
-
-
-def _feature_columns(features: pd.DataFrame) -> list[str]:
-    return [
-        column
-        for column in features.columns
-        if column not in FEATURE_ID_COLUMNS and column not in TEMPORARY_CONTEXT_COLUMNS
-    ]
-
-
-def _participant_zscore_source_columns(feature_columns: list[str]) -> list[str]:
-    """Return per-epoch columns eligible for whole-night participant z-scores."""
-    return [
-        column
-        for column in feature_columns
-        if not column.endswith(PARTICIPANT_ZSCORE_EXCLUDED_SUFFIXES)
-    ]
-
-
-def _context_group_columns(features: pd.DataFrame) -> list[str]:
-    columns = ["participant_id"]
-    if "_segment_id" in features.columns:
-        columns.append("_segment_id")
-    return columns
-
-
-def _ordered_feature_table(
-    features: pd.DataFrame, *, include_temporary: bool = False
-) -> pd.DataFrame:
-    temporary_columns = [
-        column for column in TEMPORARY_CONTEXT_COLUMNS if column in features.columns
-    ]
+def _ordered_feature_table(features: pd.DataFrame) -> pd.DataFrame:
     feature_columns = sorted(
-        column
-        for column in features.columns
-        if column not in FEATURE_ID_COLUMNS
-        and (include_temporary or column not in temporary_columns)
+        column for column in features.columns if column not in FEATURE_ID_COLUMNS
     )
     return features[[*FEATURE_ID_COLUMNS, *feature_columns]]
 
 
-def _participant_signal_arrays(participant: pd.DataFrame) -> dict[str, np.ndarray]:
-    return {
-        column: pd.to_numeric(participant[column], errors="coerce").to_numpy(
-            dtype=float
-        )
-        for column in RAW_SIGNAL_COLUMNS
-        if column in participant.columns
-    }
+def _finite(values: np.ndarray | None) -> np.ndarray:
+    if values is None:
+        return np.asarray([], dtype=float)
+    array = np.asarray(values, dtype=float)
+    return array[np.isfinite(array)]
 
 
-def _basic_epoch_features_from_arrays(
-    signal_arrays: dict[str, np.ndarray], start_row: int, end_row: int
-) -> dict[str, float]:
-    features: dict[str, float] = {}
-    for column in RAW_SIGNAL_COLUMNS:
-        if column in signal_arrays:
-            features.update(
-                summarize_signal_array(signal_arrays[column][start_row:end_row], column)
-            )
-    if all(column in signal_arrays for column in ("ACC_X", "ACC_Y", "ACC_Z")):
-        axes = np.vstack(
-            [
-                signal_arrays[column][start_row:end_row]
-                for column in ("ACC_X", "ACC_Y", "ACC_Z")
-            ]
-        )
-        valid = np.isfinite(axes).all(axis=0)
-        magnitude = np.full(axes.shape[1], np.nan, dtype=float)
-        magnitude[valid] = np.sqrt(np.square(axes[:, valid]).sum(axis=0))
-        features.update(summarize_signal_array(magnitude, ACC_MAGNITUDE_COLUMN))
-    return features
+def _acc_magnitude(epoch_arrays: dict[str, np.ndarray]) -> np.ndarray:
+    if not all(column in epoch_arrays for column in ("ACC_X", "ACC_Y", "ACC_Z")):
+        return np.asarray([], dtype=float)
+    axes = np.vstack([epoch_arrays[column] for column in ("ACC_X", "ACC_Y", "ACC_Z")])
+    valid = np.isfinite(axes).all(axis=0)
+    return np.sqrt(np.square(axes[:, valid]).sum(axis=0))
+
+
+def _mean(values: np.ndarray) -> float:
+    return float(np.mean(values)) if values.size else np.nan
+
+
+def _std(values: np.ndarray) -> float:
+    return float(np.std(values, ddof=1)) if values.size > 1 else np.nan
+
+
+def _iqr(values: np.ndarray) -> float:
+    if not values.size:
+        return np.nan
+    q25, q75 = np.quantile(values, [0.25, 0.75])
+    return float(q75 - q25)
+
+
+def _min(values: np.ndarray) -> float:
+    return float(np.min(values)) if values.size else np.nan
+
+
+def _max(values: np.ndarray) -> float:
+    return float(np.max(values)) if values.size else np.nan
