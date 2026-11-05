@@ -1,10 +1,13 @@
+import numpy as np
 import pandas as pd
 from src.data.make_epochs import build_epoch_index
 from src.features.build_features import (
-    _participant_zscore_source_columns,
+    SOMNIA_FEATURE_COLUMNS,
     build_and_write_feature_tables,
     build_basic_feature_table,
     build_rich_feature_table,
+    normalize_per_participant,
+    somnia_epoch_features,
     write_split_feature_tables,
 )
 
@@ -73,38 +76,52 @@ def test_build_rich_feature_table_adds_modular_feature_families(tmp_path):
     epoch_index_path = tmp_path / "epoch_index.csv"
     epoch_index.to_csv(epoch_index_path, index=False)
 
-    features = build_rich_feature_table(
-        raw_dir,
-        epoch_index_path,
-        rolling_windows=(3,),
-        context_source_features=("BVP_mean", "ACC_MAG_mean", "IBI_rmssd"),
-    )
+    features = build_rich_feature_table(raw_dir, epoch_index_path)
 
-    assert "BVP_mean" in features.columns
-    assert "ACC_motion_intensity" in features.columns
-    assert "IBI_rmssd" in features.columns
-    assert "IBI_sdnn" not in features.columns
-    assert "BVP_mean_roll3_mean" in features.columns
-    assert "BVP_mean_roll3_std" in features.columns
-    assert "BVP_mean_participant_z" in features.columns
-    assert "BVP_valid_fraction" in features.columns
-    assert "BVP_valid_fraction_participant_z" not in features.columns
-    assert "ACC_MAG_valid_fraction_participant_z" not in features.columns
-    assert "_segment_id" not in features.columns
+    feature_columns = [
+        c
+        for c in features.columns
+        if c not in ("participant_id", "epoch_id", "split", "label")
+    ]
+    assert sorted(feature_columns) == sorted(SOMNIA_FEATURE_COLUMNS)
     assert set(features["split"]) == {"train", "validation", "test"}
 
 
-def test_participant_zscore_sources_skip_valid_fraction_features():
-    source_columns = _participant_zscore_source_columns(
-        [
-            "BVP_mean",
-            "BVP_valid_fraction",
-            "ACC_MAG_valid_fraction",
-            "HR_abs_diff_mean",
-        ]
+def test_somnia_epoch_features_match_formulas():
+    n = 750
+    arrays = {
+        "ACC_X": np.full(n, 1.0),
+        "ACC_Y": np.zeros(n),
+        "ACC_Z": np.zeros(n),
+        "HR": np.array([60.0, 62.0, 64.0]),
+        "TEMP": np.array([33.0]),
+        "IBI": np.array([1.0, 0.9, np.nan, 1.1, 1.0]),
+    }
+
+    features = somnia_epoch_features(arrays)
+
+    assert features["ACC_mean"] == 1.0
+    assert features["HR_range"] == 4.0
+    assert features["TEMP_mean"] == 33.0
+    assert np.isclose(features["IBI_rmssd"], 0.1)
+    assert np.isclose(features["IBI_mean"], 1.0)
+
+
+def test_normalize_per_participant_uses_median_and_p95_p5():
+    frame = pd.DataFrame(
+        {
+            "participant_id": ["S001"] * 5,
+            "HR_mean": [50.0, 60.0, 70.0, 80.0, 90.0],
+            "ACC_mean": [1.0] * 5,
+        }
     )
 
-    assert source_columns == ["BVP_mean", "HR_abs_diff_mean"]
+    normalized = normalize_per_participant(frame)
+
+    assert "HR_mean" not in normalized.columns
+    assert "ACC_mean" in normalized.columns
+    assert np.isclose(normalized["HR_mean_norm"].iloc[2], 0.0)
+    assert np.isclose(normalized["HR_mean_norm"].iloc[4], 20.0 / 36.0)
 
 
 def test_build_and_write_feature_tables_writes_csv_manifest(tmp_path):
@@ -130,10 +147,7 @@ def test_build_and_write_feature_tables_writes_csv_manifest(tmp_path):
     manifest = pd.read_csv(written["manifest"])
     assert set(written) == {"train", "validation", "test", "manifest"}
     assert (tmp_path / "processed" / "features_train.csv").exists()
-    assert {
-        "basic_statistical",
-        "signal_specific",
-        "rolling_context",
-        "whole_night_subject_normalized",
-    }.issubset(set(manifest["feature_family"]))
-    assert "cardiovascular" in set(manifest["signal_group"])
+    assert set(manifest["feature"]) == set(SOMNIA_FEATURE_COLUMNS)
+    assert {"movement", "cardiovascular", "temperature"} == set(
+        manifest["signal_group"]
+    )
